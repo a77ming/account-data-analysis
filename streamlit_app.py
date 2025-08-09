@@ -5,7 +5,10 @@ from datetime import datetime
 import time
 import io
 import numpy as np
-from typing import List
+from typing import List, Dict, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
+import threading
 
 # 设置页面配置
 st.set_page_config(
@@ -16,8 +19,52 @@ st.set_page_config(
 
 
 
+# 全局缓存字典，避免重复API调用
+user_info_cache = {}
+cache_lock = threading.Lock()
+
+def validate_username(username: str) -> bool:
+    """验证用户名格式是否有效"""
+    if not username or len(username.strip()) == 0:
+        return False
+    
+    # TikTok用户名规则：字母、数字、下划线、点号，长度1-24
+    import re
+    pattern = r'^[a-zA-Z0-9._]{1,24}$'
+    return bool(re.match(pattern, username.strip()))
+
+def get_account_status_info(username: str) -> dict:
+    """获取账号状态信息，用于诊断失败原因"""
+    url = f"https://www.tikwm.com/api/user/info?unique_id={username}"
+    try:
+        response = requests.get(url, timeout=10)
+        if response.status_code != 200:
+            return {"status": "http_error", "code": response.status_code}
+        
+        data = response.json()
+        return {
+            "status": "api_response",
+            "code": data.get("code", "unknown"),
+            "msg": data.get("msg", ""),
+            "has_data": "data" in data
+        }
+    except Exception as e:
+        return {"status": "network_error", "error": str(e)}
+
+@st.cache_data(ttl=300)  # 缓存5分钟
+def fetch_user_info_cached(username: str) -> dict:
+    """获取用户详细信息（带缓存）"""
+    return fetch_user_info(username)
+
 def fetch_user_info(username: str, log_container=None) -> dict:
     """获取用户详细信息"""
+    # 检查缓存
+    with cache_lock:
+        if username in user_info_cache:
+            if log_container:
+                log_container.info(f"📋 {username}: 使用缓存数据")
+            return user_info_cache[username]
+    
     url = f"https://www.tikwm.com/api/user/info?unique_id={username}"
     try:
         response = requests.get(url, timeout=15)  # 增加超时时间
@@ -33,6 +80,10 @@ def fetch_user_info(username: str, log_container=None) -> dict:
                 "获赞数": stats_data.get("heartCount", stats_data.get("heart", 0)),
                 "总视频数": stats_data.get("videoCount", 0)
             }
+            # 缓存结果
+            with cache_lock:
+                user_info_cache[username] = result
+            
             # 记录到日志容器
             if log_container:
                 log_container.success(f"✅ {username}: 粉丝{result['粉丝数']}人, 关注{result['关注数']}人, 获赞{result['获赞数']}个")
@@ -63,61 +114,127 @@ def fetch_user_info(username: str, log_container=None) -> dict:
             "总视频数": 0
         }
 
-def fetch_user_videos(username: str, limit: int = 3, log_container=None) -> List[dict]:
-    """抓取指定用户的视频数据"""
-    url = f"https://www.tikwm.com/api/user/posts?unique_id={username}"
-    try:
-        response = requests.get(url, timeout=15)  # 增加超时时间
-        data = response.json()
-        result = []
-
-        if data.get("code") == 0 and "data" in data:
-            # 获取用户详细信息
-            user_info = fetch_user_info(username, log_container)
+def fetch_user_videos(username: str, limit: int = 3, log_container=None, max_retries: int = 2) -> List[dict]:
+    """抓取指定用户的视频数据（优化版本，减少API调用）"""
+    
+    for attempt in range(max_retries + 1):
+        url = f"https://www.tikwm.com/api/user/posts?unique_id={username}"
+        try:
+            response = requests.get(url, timeout=15)
             
-            # 检查数据结构
-            data_content = data["data"]
-            videos = data_content.get("videos", [])[:limit]
-            
-            if not videos:
-                if log_container:
-                    log_container.warning(f"⚠️ {username} 没有找到视频数据")
+            # 检查HTTP状态码
+            if response.status_code != 200:
+                if log_container and attempt == max_retries:
+                    log_container.error(f"❌ {username} HTTP错误: {response.status_code}")
+                if attempt < max_retries:
+                    time.sleep(1)  # 重试前等待
+                    continue
                 return []
             
-            for video in videos:
-                # 每个视频都有author信息，使用当前视频的author信息
-                author = video.get("author", {})
-                
-                result.append({
-                    "账号": username,
-                    "昵称": user_info.get("昵称", author.get("nickname", author.get("unique_id", ""))),
-                    "头像": user_info.get("头像", author.get("avatar", "")),
-                    "关注数": user_info.get("关注数", 0),
-                    "粉丝数": user_info.get("粉丝数", 0),
-                    "获赞数": user_info.get("获赞数", 0),
-                    "总视频数": user_info.get("总视频数", 0),
-                    "视频链接": f"https://www.tiktok.com/@{username}/video/{video.get('video_id', '')}",
-                    "发布时间": datetime.fromtimestamp(video.get("create_time", 0)).strftime("%Y-%m-%d %H:%M:%S") if video.get("create_time") else "",
-                    "播放量": video.get("play_count", 0),
-                    "点赞": video.get("digg_count", 0),
-                    "评论": video.get("comment_count", 0),
-                    "收藏": video.get("collect_count", 0),
-                    "封面图链接": video.get("cover", "")
-                })
-            
-            if log_container:
-                log_container.success(f"✅ {username} 成功获取 {len(result)} 条视频数据")
-            
-        else:
-            error_msg = data.get('msg', '未知错误')
-            if log_container:
-                log_container.error(f"❌ {username} 视频获取失败: {error_msg}")
+            data = response.json()
+            result = []
 
-        return result
-    except Exception as e:
-        if log_container:
-            log_container.error(f"🚨 {username} 视频获取网络错误: {str(e)}")
-        return []
+            if data.get("code") == 0 and "data" in data:
+                data_content = data["data"]
+                videos = data_content.get("videos", [])[:limit]
+                
+                if not videos:
+                    if log_container:
+                        log_container.warning(f"⚠️ {username} 没有找到视频数据")
+                    return []
+                
+                # 尝试从第一个视频的author信息获取用户数据，避免额外API调用
+                first_video = videos[0]
+                author = first_video.get("author", {})
+                
+                # 如果author信息不完整，再调用用户信息API
+                user_info = None
+                if not author.get("follower_count") and not author.get("following_count"):
+                    user_info = fetch_user_info(username, log_container)
+                
+                for video in videos:
+                    video_author = video.get("author", {})
+                    
+                    # 优先使用缓存的用户信息，其次使用视频中的author信息
+                    if user_info:
+                        nickname = user_info.get("昵称", video_author.get("nickname", username))
+                        avatar = user_info.get("头像", video_author.get("avatar", ""))
+                        following_count = user_info.get("关注数", 0)
+                        follower_count = user_info.get("粉丝数", 0)
+                        heart_count = user_info.get("获赞数", 0)
+                        video_count = user_info.get("总视频数", 0)
+                    else:
+                        nickname = video_author.get("nickname", username)
+                        avatar = video_author.get("avatar", "")
+                        following_count = video_author.get("following_count", 0)
+                        follower_count = video_author.get("follower_count", 0)
+                        heart_count = video_author.get("heart_count", 0)
+                        video_count = video_author.get("aweme_count", 0)
+                    
+                    result.append({
+                        "账号": username,
+                        "昵称": nickname,
+                        "头像": avatar,
+                        "关注数": following_count,
+                        "粉丝数": follower_count,
+                        "获赞数": heart_count,
+                        "总视频数": video_count,
+                        "视频链接": f"https://www.tiktok.com/@{username}/video/{video.get('video_id', '')}",
+                        "发布时间": datetime.fromtimestamp(video.get("create_time", 0)).strftime("%Y-%m-%d %H:%M:%S") if video.get("create_time") else "",
+                        "播放量": video.get("play_count", 0),
+                        "点赞": video.get("digg_count", 0),
+                        "评论": video.get("comment_count", 0),
+                        "收藏": video.get("collect_count", 0),
+                        "封面图链接": video.get("cover", "")
+                    })
+            
+                if log_container:
+                    log_container.success(f"✅ {username} 成功获取 {len(result)} 条视频数据")
+                return result
+                
+            else:
+                # API返回错误码
+                error_msg = data.get('msg', '未知错误')
+                error_code = data.get('code', 'unknown')
+                
+                if log_container:
+                    if attempt == max_retries:
+                        log_container.error(f"❌ {username} API错误 (code: {error_code}): {error_msg}")
+                    else:
+                        log_container.warning(f"⚠️ {username} 重试中... (code: {error_code})")
+                
+                # 某些错误码可以重试
+                if error_code in [-1, -2] and attempt < max_retries:
+                    time.sleep(1)
+                    continue
+                
+                return []
+                
+        except requests.exceptions.Timeout:
+            if log_container and attempt == max_retries:
+                log_container.error(f"⏰ {username} 请求超时")
+            if attempt < max_retries:
+                time.sleep(1)
+                continue
+            return []
+            
+        except requests.exceptions.RequestException as e:
+            if log_container and attempt == max_retries:
+                log_container.error(f"🌐 {username} 网络错误: {str(e)}")
+            if attempt < max_retries:
+                time.sleep(1)
+                continue
+            return []
+            
+        except Exception as e:
+            if log_container and attempt == max_retries:
+                log_container.error(f"🚨 {username} 未知错误: {str(e)}")
+            if attempt < max_retries:
+                time.sleep(1)
+                continue
+            return []
+    
+    return []  # 所有重试都失败
 
 def detect_throttling(df: pd.DataFrame) -> pd.DataFrame:
     """检测视频限流状态"""
@@ -672,8 +789,29 @@ def display_analytics_section(df: pd.DataFrame):
             f"{best_depth['深度互动比例']*100:.2f}%"
         )
 
-def process_usernames(usernames: List[str], video_limit: int, sleep_time: float) -> pd.DataFrame:
-    """处理用户名列表，抓取所有数据"""
+def fetch_single_user_data(username: str, video_limit: int, sleep_time: float) -> tuple:
+    """抓取单个用户数据的辅助函数"""
+    try:
+        time.sleep(sleep_time)  # 限速
+        
+        # 验证用户名格式
+        if not validate_username(username):
+            return username, [], False, "invalid_username"
+        
+        user_data = fetch_user_videos(username, video_limit)
+        
+        if user_data:
+            return username, user_data, True, "success"
+        else:
+            # 获取详细的失败原因
+            status_info = get_account_status_info(username)
+            return username, [], False, f"no_data_{status_info.get('status', 'unknown')}"
+            
+    except Exception as e:
+        return username, [], False, f"exception_{str(e)[:50]}"
+
+def process_usernames(usernames: List[str], video_limit: int, sleep_time: float, max_workers: int = 5) -> pd.DataFrame:
+    """处理用户名列表，抓取所有数据（并发版本）"""
     all_data = []
     progress_bar = st.progress(0)
     status_text = st.empty()
@@ -686,25 +824,57 @@ def process_usernames(usernames: List[str], video_limit: int, sleep_time: float)
     # 统计信息
     success_count = 0
     error_count = 0
+    completed_count = 0
     
-    for idx, username in enumerate(usernames):
-        # 更新进度
-        progress = (idx + 1) / len(usernames)
-        progress_bar.progress(progress)
-        status_text.text(f"正在抓取第 {idx + 1}/{len(usernames)} 个账号: {username} (成功: {success_count}, 失败: {error_count})")
+    # 使用线程池并发处理
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # 提交所有任务
+        future_to_username = {
+            executor.submit(fetch_single_user_data, username, video_limit, sleep_time): username 
+            for username in usernames
+        }
         
-        # 抓取数据
-        user_data = fetch_user_videos(username, video_limit, log_container)
-        
-        if user_data:
-            all_data.extend(user_data)
-            success_count += 1
-        else:
-            error_count += 1
-        
-        # 延时
-        if idx < len(usernames) - 1:  # 最后一个不需要延时
-            time.sleep(sleep_time)
+        # 处理完成的任务
+        for future in as_completed(future_to_username):
+            username = future_to_username[future]
+            completed_count += 1
+            
+            try:
+                username, user_data, success, reason = future.result()
+                
+                if success and user_data:
+                    all_data.extend(user_data)
+                    success_count += 1
+                    if log_container:
+                        log_container.success(f"✅ {username}: 成功获取 {len(user_data)} 条视频数据")
+                else:
+                    error_count += 1
+                    if log_container:
+                        # 根据失败原因提供更详细的错误信息
+                        if reason == "invalid_username":
+                            log_container.error(f"❌ {username}: 用户名格式无效")
+                        elif reason.startswith("no_data_"):
+                            status = reason.replace("no_data_", "")
+                            if status == "http_error":
+                                log_container.error(f"❌ {username}: HTTP请求失败")
+                            elif status == "network_error":
+                                log_container.error(f"❌ {username}: 网络连接失败")
+                            else:
+                                log_container.error(f"❌ {username}: 账号不存在或无公开视频")
+                        elif reason.startswith("exception_"):
+                            log_container.error(f"❌ {username}: 处理异常")
+                        else:
+                            log_container.error(f"❌ {username}: 数据获取失败 ({reason})")
+                        
+            except Exception as e:
+                error_count += 1
+                if log_container:
+                    log_container.error(f"🚨 {username}: 处理异常 - {str(e)}")
+            
+            # 更新进度
+            progress = completed_count / len(usernames)
+            progress_bar.progress(progress)
+            status_text.text(f"进度: {completed_count}/{len(usernames)} (成功: {success_count}, 失败: {error_count})")
     
     # 最终统计
     with log_container:
@@ -738,6 +908,14 @@ def main():
         help="设置较长的间隔可以避免被限速"
     )
     
+    max_workers = st.sidebar.number_input(
+        "并发线程数", 
+        min_value=1, 
+        max_value=10, 
+        value=3, 
+        help="并发数越高速度越快，但可能被限流。建议3-5个"
+    )
+    
     st.sidebar.markdown("---")
     st.sidebar.markdown("### 📋 使用说明")
     st.sidebar.markdown("""
@@ -746,6 +924,41 @@ def main():
     2. 配置抓取参数
     3. 点击开始抓取
     4. 下载结果文件
+    """)
+    
+    st.sidebar.markdown("### ⚡ 性能优化")
+    st.sidebar.markdown("""
+    **并发设置建议：**
+    - 小批量(<50个): 并发3-5个
+    - 大批量(>100个): 并发2-3个
+    - 间隔时间: 1-2秒较安全
+    
+    **缓存机制：**
+    - 用户信息自动缓存5分钟
+    - 重复查询会使用缓存数据
+    - 大幅提升处理速度
+    """)
+    
+    # 清除缓存按钮
+    if st.sidebar.button("🗑️ 清除缓存"):
+        with cache_lock:
+            user_info_cache.clear()
+        st.sidebar.success("缓存已清除！")
+    
+    st.sidebar.markdown("### ❓ 常见问题")
+    st.sidebar.markdown("""
+    **获取失败的可能原因：**
+    - 账号不存在或已删除
+    - 账号设置为私密
+    - 账号没有公开视频
+    - 用户名格式错误
+    - API临时限流
+    - 网络连接问题
+    
+    **解决方案：**
+    - 检查用户名拼写
+    - 降低并发数和增加间隔
+    - 重试失败的账号
     """)
     
     # 主界面
@@ -802,8 +1015,10 @@ def main():
         if uploaded_file is not None and 'usernames' in locals():
             st.metric("用户总数", len(usernames))
             st.metric("预计视频数", len(usernames) * video_limit)
-            estimated_time = len(usernames) * sleep_time / 60
+            # 考虑并发的预计时间
+            estimated_time = (len(usernames) * sleep_time) / max_workers / 60
             st.metric("预计耗时", f"{estimated_time:.1f} 分钟")
+            st.caption(f"并发{max_workers}个线程")
     
     # 开始抓取按钮
     if uploaded_file is not None and 'usernames' in locals():
@@ -815,7 +1030,7 @@ def main():
                 start_time = time.time()
                 
                 with st.spinner("正在抓取数据，请稍候..."):
-                    result_df = process_usernames(usernames, video_limit, sleep_time)
+                    result_df = process_usernames(usernames, video_limit, sleep_time, max_workers)
                 
                 end_time = time.time()
                 duration = end_time - start_time
@@ -855,6 +1070,40 @@ def main():
                         st.metric("总获赞数", f"{unique_users['获赞数'].sum():,}")
                     with col4:
                         st.metric("平均粉丝数", f"{unique_users['粉丝数'].mean():.0f}")
+                    
+                    # 成功率分析
+                    successful_accounts = len(unique_users)
+                    total_accounts = len(usernames)
+                    failed_accounts = total_accounts - successful_accounts
+                    success_rate = (successful_accounts / total_accounts) * 100
+                    
+                    if failed_accounts > 0:
+                        st.subheader("⚠️ 失败账号分析")
+                        col1, col2, col3 = st.columns(3)
+                        
+                        with col1:
+                            st.metric("成功账号", successful_accounts, f"{success_rate:.1f}%")
+                        with col2:
+                            st.metric("失败账号", failed_accounts, f"{100-success_rate:.1f}%")
+                        with col3:
+                            st.metric("成功率", f"{success_rate:.1f}%")
+                        
+                        # 失败账号列表
+                        successful_usernames = set(unique_users['账号'].tolist())
+                        failed_usernames = [u for u in usernames if u not in successful_usernames]
+                        
+                        if failed_usernames:
+                            st.write("**失败的账号列表：**")
+                            failed_text = ", ".join(failed_usernames)
+                            st.text_area("失败账号（可复制重试）", failed_text, height=100)
+                            
+                            st.info(f"""
+                            💡 **改进建议：**
+                            - 检查失败账号的用户名拼写
+                            - 降低并发数到 1-2 个
+                            - 增加请求间隔到 2-3 秒
+                            - 单独重试失败的账号
+                            """)
                     
                     # 数据分析部分
                     display_analytics_section(result_df)
